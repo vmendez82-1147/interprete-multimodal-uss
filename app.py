@@ -3,7 +3,6 @@ import re
 import tempfile
 import urllib.parse
 import numpy as np
-import pandas as pd
 import scipy.io.wavfile as wavfile
 import streamlit as st
 import torch
@@ -52,15 +51,16 @@ def canonicalize_chilean_spanish(text: str):
     return normalized, detected
 
 @st.cache_resource
-def load_base_models():
-    asr = pipeline("automatic-speech-recognition", model="openai/whisper-small", device=device, torch_dtype=torch_dtype)
+def get_asr():
+    return pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=device, torch_dtype=torch_dtype)
+
+@st.cache_resource
+def get_translator():
     model_name = "facebook/nllb-200-distilled-600M"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
     model.eval()
-    return asr, tokenizer, model
-
-asr, tokenizer_nllb, model_nllb = load_base_models()
+    return tokenizer, model
 
 @st.cache_resource
 def get_tts(lang_name):
@@ -91,6 +91,7 @@ def synthesize_speech(text, target_lang="Español"):
 def translate_text(text, src_lang_name, tgt_lang_name):
     if not text or not text.strip():
         return ""
+    tokenizer_nllb, model_nllb = get_translator()
     src_code = LANGUAGES[src_lang_name]["nllb"]
     tgt_code = LANGUAGES[tgt_lang_name]["nllb"]
     tokenizer_nllb.src_lang = src_code
@@ -105,6 +106,7 @@ def translate_text(text, src_lang_name, tgt_lang_name):
         )
     return tokenizer_nllb.batch_decode(outputs, skip_special_tokens=True)[0]
 
+# Interfaz
 st.title("🗣️ Intérprete Multimodal & Multilingüe USS")
 tab1, tab2 = st.tabs(["🌐 Intérprete Universal", "🤖 Asistente Guía"])
 
@@ -130,47 +132,49 @@ with tab1:
     with col2:
         st.subheader("2. Resultados")
         if btn_run:
-            raw_text = ""
-            if mode == "🎙️ Audio" and audio_file:
-                tfile = tempfile.NamedTemporaryFile(delete=False)
-                tfile.write(audio_file.read())
-                lang_whisper = LANGUAGES[src_lang]["whisper"]
-                raw_text = asr(tfile.name, generate_kwargs={"language": lang_whisper})["text"].strip()
-            elif mode == "📄 Documento (PDF/DOCX)" and doc_file:
-                ext = os.path.splitext(doc_file.name)[-1].lower()
-                if ext == ".pdf":
-                    import pypdf
-                    reader = pypdf.PdfReader(doc_file)
-                    raw_text = " ".join([p.extract_text() for p in reader.pages[:3] if p.extract_text()])
-                elif ext == ".docx":
-                    import docx
-                    doc = docx.Document(doc_file)
-                    raw_text = " ".join([p.text for p in doc.paragraphs if p.text])
-            elif mode == "📷 Imagen/Foto (OCR)" and img_file:
-                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                tfile.write(img_file.read())
-                reader = get_ocr()
-                raw_text = " ".join(reader.readtext(tfile.name, detail=0)).strip()
+            with st.spinner("Procesando entrada y modelos..."):
+                raw_text = ""
+                if mode == "🎙️ Audio" and audio_file:
+                    tfile = tempfile.NamedTemporaryFile(delete=False)
+                    tfile.write(audio_file.read())
+                    asr = get_asr()
+                    lang_whisper = LANGUAGES[src_lang]["whisper"]
+                    raw_text = asr(tfile.name, generate_kwargs={"language": lang_whisper})["text"].strip()
+                elif mode == "📄 Documento (PDF/DOCX)" and doc_file:
+                    ext = os.path.splitext(doc_file.name)[-1].lower()
+                    if ext == ".pdf":
+                        import pypdf
+                        reader = pypdf.PdfReader(doc_file)
+                        raw_text = " ".join([p.extract_text() for p in reader.pages[:3] if p.extract_text()])
+                    elif ext == ".docx":
+                        import docx
+                        doc = docx.Document(doc_file)
+                        raw_text = " ".join([p.text for p in doc.paragraphs if p.text])
+                elif mode == "📷 Imagen/Foto (OCR)" and img_file:
+                    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                    tfile.write(img_file.read())
+                    reader = get_ocr()
+                    raw_text = " ".join(reader.readtext(tfile.name, detail=0)).strip()
 
-            if raw_text:
-                st.write("**Texto Detectado:**", raw_text)
-                clean_text = raw_text
-                if src_lang == "Español" and use_slang:
-                    clean_text, detected = canonicalize_chilean_spanish(raw_text)
-                    if detected:
-                        st.info("Modismos detectados: " + ", ".join(detected))
+                if raw_text:
+                    st.write("**Texto Detectado:**", raw_text)
+                    clean_text = raw_text
+                    if src_lang == "Español" and use_slang:
+                        clean_text, detected = canonicalize_chilean_spanish(raw_text)
+                        if detected:
+                            st.info("Modismos detectados: " + ", ".join(detected))
 
-                translation = translate_text(clean_text, src_lang, tgt_lang)
-                st.success("**Traducción Final:** " + translation)
+                    translation = translate_text(clean_text, src_lang, tgt_lang)
+                    st.success("**Traducción Final:** " + translation)
 
-                audio_path = synthesize_speech(translation, tgt_lang)
-                st.audio(audio_path, format="audio/wav")
+                    audio_path = synthesize_speech(translation, tgt_lang)
+                    st.audio(audio_path, format="audio/wav")
 
-                wsp_msg = f"🎙️ Traducción USS ({src_lang} ➔ {tgt_lang}):\nOriginal: {raw_text}\nTraducción: {translation}"
-                url_wsp = f"https://api.whatsapp.com/send?text={urllib.parse.quote(wsp_msg)}"
-                st.markdown(f"[📲 Compartir en WhatsApp]({url_wsp})")
-            else:
-                st.warning("No se pudo procesar la entrada o no se cargó ningún archivo.")
+                    wsp_msg = f"🎙️ Traducción USS ({src_lang} ➔ {tgt_lang}):\nOriginal: {raw_text}\nTraducción: {translation}"
+                    url_wsp = f"https://api.whatsapp.com/send?text={urllib.parse.quote(wsp_msg)}"
+                    st.markdown(f"[📲 Compartir en WhatsApp]({url_wsp})")
+                else:
+                    st.warning("No se pudo procesar la entrada o no se cargó ningún archivo.")
 
 with tab2:
     st.subheader("Asistente del Proyecto")
@@ -182,6 +186,6 @@ with tab2:
         elif "modismo" in q:
             st.write("Normaliza expresiones coloquiales chilenas antes de pasar el texto al modelo de traducción.")
         elif "modelo" in q:
-            st.write("Arquitectura: Whisper Small (ASR), EasyOCR (Visión), NLLB-200 (Traducción) y MMS-TTS (Voz).")
+            st.write("Arquitectura: Whisper (ASR), EasyOCR (Visión), NLLB-200 (Traducción) y MMS-TTS (Voz).")
         else:
             st.write("Puedes consultar sobre idiomas soportados, modelos de IA o el filtro de modismos chilenos.")

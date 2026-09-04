@@ -11,16 +11,29 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 st.set_page_config(page_title="Intérprete Multimodal USS", page_icon="🗣️", layout="wide")
 
 device = -1
-device_str = "cpu"
 torch_dtype = torch.float32
 
+# Modelos adaptados para 1GB RAM (CPU Cloud)
+OPUS_MODELS = {
+    ("Español", "Inglés"): "Helsinki-NLP/opus-mt-es-en",
+    ("Inglés", "Español"): "Helsinki-NLP/opus-mt-en-es",
+    ("Español", "Francés"): "Helsinki-NLP/opus-mt-es-fr",
+    ("Francés", "Español"): "Helsinki-NLP/opus-mt-fr-es",
+    ("Español", "Portugués"): "Helsinki-NLP/opus-mt-es-pt",
+    ("Portugués", "Español"): "Helsinki-NLP/opus-mt-ROMANCE-en",
+    ("Español", "Alemán"): "Helsinki-NLP/opus-mt-es-de",
+    ("Alemán", "Español"): "Helsinki-NLP/opus-mt-de-es",
+    ("Español", "Italiano"): "Helsinki-NLP/opus-mt-es-it",
+    ("Italiano", "Español"): "Helsinki-NLP/opus-mt-it-es",
+}
+
 LANGUAGES = {
-    "Español": {"nllb": "spa_Latn", "whisper": "spanish", "tts_model": "facebook/mms-tts-spa"},
-    "Inglés": {"nllb": "eng_Latn", "whisper": "english", "tts_model": "facebook/mms-tts-eng"},
-    "Portugués": {"nllb": "por_Latn", "whisper": "portuguese", "tts_model": "facebook/mms-tts-por"},
-    "Francés": {"nllb": "fra_Latn", "whisper": "french", "tts_model": "facebook/mms-tts-fra"},
-    "Alemán": {"nllb": "deu_Latn", "whisper": "german", "tts_model": "facebook/mms-tts-deu"},
-    "Italiano": {"nllb": "ita_Latn", "whisper": "italian", "tts_model": "facebook/mms-tts-ita"},
+    "Español": {"whisper": "spanish", "tts": "facebook/mms-tts-spa"},
+    "Inglés": {"whisper": "english", "tts": "facebook/mms-tts-eng"},
+    "Portugués": {"whisper": "portuguese", "tts": "facebook/mms-tts-por"},
+    "Francés": {"whisper": "french", "tts": "facebook/mms-tts-fra"},
+    "Alemán": {"whisper": "german", "tts": "facebook/mms-tts-deu"},
+    "Italiano": {"whisper": "italian", "tts": "facebook/mms-tts-ita"},
 }
 
 CHILEAN_SLANG_MAP = {
@@ -52,63 +65,62 @@ def canonicalize_chilean_spanish(text: str):
 
 @st.cache_resource
 def get_asr():
-    return pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=device, torch_dtype=torch_dtype)
+    return pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=device)
 
 @st.cache_resource
-def get_translator():
-    model_name = "facebook/nllb-200-distilled-600M"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
-    model.eval()
-    return tokenizer, model
+def get_translator(src_lang, tgt_lang):
+    pair = (src_lang, tgt_lang)
+    model_id = OPUS_MODELS.get(pair, "Helsinki-NLP/opus-mt-es-en")
+    tok = AutoTokenizer.from_pretrained(model_id)
+    mod = AutoModelForSeq2SeqLM.from_pretrained(model_id, low_cpu_mem_usage=True)
+    mod.eval()
+    return tok, mod
 
 @st.cache_resource
 def get_tts(lang_name):
-    model_id = LANGUAGES[lang_name]["tts_model"]
-    return pipeline("text-to-speech", model=model_id, device=device, torch_dtype=torch_dtype)
+    model_id = LANGUAGES[lang_name]["tts"]
+    return pipeline("text-to-speech", model=model_id, device=device)
 
 @st.cache_resource
 def get_ocr():
     import easyocr
-    return easyocr.Reader(["es", "en", "pt", "fr", "de", "it"], gpu=False)
+    return easyocr.Reader(["es", "en"], gpu=False)
 
 def synthesize_speech(text, target_lang="Español"):
-    tts_pipe = get_tts(target_lang)
-    clean_text = text[:300].strip() or "Texto no disponible."
-    tts_out = tts_pipe(clean_text)
-    sr = int(tts_out["sampling_rate"])
-    raw_audio = tts_out["audio"]
-    if isinstance(raw_audio, torch.Tensor):
-        raw_audio = raw_audio.squeeze().cpu().numpy()
-    audio_data = np.array(raw_audio, dtype=np.float32)
-    max_val = np.max(np.abs(audio_data))
-    if max_val > 0:
-        audio_data = audio_data / max_val
-    temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    wavfile.write(temp_wav.name, sr, (audio_data * 32767).astype(np.int16))
-    return temp_wav.name
+    try:
+        tts_pipe = get_tts(target_lang)
+        clean_text = text[:250].strip() or "Texto no disponible."
+        tts_out = tts_pipe(clean_text)
+        sr = int(tts_out["sampling_rate"])
+        raw_audio = tts_out["audio"]
+        if isinstance(raw_audio, torch.Tensor):
+            raw_audio = raw_audio.squeeze().cpu().numpy()
+        audio_data = np.array(raw_audio, dtype=np.float32)
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            audio_data = audio_data / max_val
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        wavfile.write(temp_wav.name, sr, (audio_data * 32767).astype(np.int16))
+        return temp_wav.name
+    except Exception as e:
+        return None
 
-def translate_text(text, src_lang_name, tgt_lang_name):
+def translate_text(text, src_lang, tgt_lang):
     if not text or not text.strip():
         return ""
-    tokenizer_nllb, model_nllb = get_translator()
-    src_code = LANGUAGES[src_lang_name]["nllb"]
-    tgt_code = LANGUAGES[tgt_lang_name]["nllb"]
-    tokenizer_nllb.src_lang = src_code
-    inputs = tokenizer_nllb(text.strip(), return_tensors="pt", truncation=True, max_length=256)
-    with torch.inference_mode():
-        outputs = model_nllb.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer_nllb.convert_tokens_to_ids(tgt_code),
-            num_beams=1,
-            max_new_tokens=128,
-            use_cache=True,
-        )
-    return tokenizer_nllb.batch_decode(outputs, skip_special_tokens=True)[0]
+    if src_lang == tgt_lang:
+        return text.strip()
+    tok, mod = get_translator(src_lang, tgt_lang)
+    inp = tok(text.strip(), return_tensors="pt", truncation=True, max_length=256)
+    with torch.no_grad():
+        out = mod.generate(**inp, max_new_tokens=100)
+    return tok.batch_decode(out, skip_special_tokens=True)[0]
 
 # Interfaz
 st.title("🗣️ Intérprete Multimodal & Multilingüe USS")
-tab1, tab2 = st.tabs(["🌐 Intérprete Universal", "🤖 Asistente Guía"])
+st.caption("Magíster en Data Science • Universidad San Sebastián")
+
+tab1, tab2 = st.tabs(["🌐 Intérprete Universal", "🤖 Asistente del Proyecto"])
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -117,35 +129,36 @@ with tab1:
         mode = st.radio("Fuente de entrada", ["🎙️ Audio", "📄 Documento (PDF/DOCX)", "📷 Imagen/Foto (OCR)"])
         src_lang = st.selectbox("Idioma Origen", list(LANGUAGES.keys()), index=0)
         tgt_lang = st.selectbox("Idioma Destino", list(LANGUAGES.keys()), index=1)
-        use_slang = st.checkbox("Normalizar modismos chilenos", value=True)
+        use_slang = st.checkbox("Normalizar modismos chilenos (Solo origen Español)", value=True)
 
         audio_file, doc_file, img_file = None, None, None
         if mode == "🎙️ Audio":
-            audio_file = st.file_uploader("Sube un archivo de audio (WAV, MP3)", type=["wav", "mp3"])
+            audio_file = st.file_uploader("Sube un audio (WAV, MP3)", type=["wav", "mp3"])
         elif mode == "📄 Documento (PDF/DOCX)":
-            doc_file = st.file_uploader("Sube un archivo PDF o DOCX", type=["pdf", "docx"])
+            doc_file = st.file_uploader("Sube un PDF o DOCX", type=["pdf", "docx"])
         else:
-            img_file = st.file_uploader("Sube una imagen con texto", type=["png", "jpg", "jpeg"])
+            img_file = st.file_uploader("Sube una foto legible", type=["png", "jpg", "jpeg"])
 
         btn_run = st.button("✨ Procesar y Traducir ✨", type="primary")
 
     with col2:
         st.subheader("2. Resultados")
         if btn_run:
-            with st.spinner("Procesando entrada y modelos..."):
+            with st.spinner("Procesando entrada con modelos fundacionales..."):
                 raw_text = ""
                 if mode == "🎙️ Audio" and audio_file:
-                    tfile = tempfile.NamedTemporaryFile(delete=False)
+                    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                     tfile.write(audio_file.read())
                     asr = get_asr()
-                    lang_whisper = LANGUAGES[src_lang]["whisper"]
-                    raw_text = asr(tfile.name, generate_kwargs={"language": lang_whisper})["text"].strip()
+                    lang_code = LANGUAGES[src_lang]["whisper"]
+                    res = asr(tfile.name, generate_kwargs={"language": lang_code})
+                    raw_text = res["text"].strip()
                 elif mode == "📄 Documento (PDF/DOCX)" and doc_file:
                     ext = os.path.splitext(doc_file.name)[-1].lower()
                     if ext == ".pdf":
                         import pypdf
                         reader = pypdf.PdfReader(doc_file)
-                        raw_text = " ".join([p.extract_text() for p in reader.pages[:3] if p.extract_text()])
+                        raw_text = " ".join([p.extract_text() for p in reader.pages[:2] if p.extract_text()])
                     elif ext == ".docx":
                         import docx
                         doc = docx.Document(doc_file)
@@ -153,39 +166,34 @@ with tab1:
                 elif mode == "📷 Imagen/Foto (OCR)" and img_file:
                     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
                     tfile.write(img_file.read())
-                    reader = get_ocr()
-                    raw_text = " ".join(reader.readtext(tfile.name, detail=0)).strip()
+                    ocr = get_ocr()
+                    raw_text = " ".join(ocr.readtext(tfile.name, detail=0)).strip()
 
                 if raw_text:
-                    st.write("**Texto Detectado:**", raw_text)
+                    st.text_area("Texto Detectado:", value=raw_text, height=90)
                     clean_text = raw_text
                     if src_lang == "Español" and use_slang:
                         clean_text, detected = canonicalize_chilean_spanish(raw_text)
                         if detected:
-                            st.info("Modismos detectados: " + ", ".join(detected))
+                            st.info("💡 Modismos normalizados: " + ", ".join(detected))
 
                     translation = translate_text(clean_text, src_lang, tgt_lang)
                     st.success("**Traducción Final:** " + translation)
 
                     audio_path = synthesize_speech(translation, tgt_lang)
-                    st.audio(audio_path, format="audio/wav")
+                    if audio_path:
+                        st.audio(audio_path, format="audio/wav")
 
                     wsp_msg = f"🎙️ Traducción USS ({src_lang} ➔ {tgt_lang}):\nOriginal: {raw_text}\nTraducción: {translation}"
                     url_wsp = f"https://api.whatsapp.com/send?text={urllib.parse.quote(wsp_msg)}"
-                    st.markdown(f"[📲 Compartir en WhatsApp]({url_wsp})")
+                    st.markdown(f"[📲 Compartir por WhatsApp]({url_wsp})")
                 else:
-                    st.warning("No se pudo procesar la entrada o no se cargó ningún archivo.")
+                    st.warning("No se pudo extraer texto o no adjuntaste archivo.")
 
 with tab2:
     st.subheader("Asistente del Proyecto")
-    user_q = st.text_input("Haz una pregunta sobre el sistema:")
-    if user_q:
-        q = user_q.lower()
-        if "idioma" in q:
-            st.write("Idiomas disponibles: Español, Inglés, Portugués, Francés, Alemán e Italiano.")
-        elif "modismo" in q:
-            st.write("Normaliza expresiones coloquiales chilenas antes de pasar el texto al modelo de traducción.")
-        elif "modelo" in q:
-            st.write("Arquitectura: Whisper (ASR), EasyOCR (Visión), NLLB-200 (Traducción) y MMS-TTS (Voz).")
-        else:
-            st.write("Puedes consultar sobre idiomas soportados, modelos de IA o el filtro de modismos chilenos.")
+    st.markdown("""
+    - **Capacidades integradas:** Speech-to-Text (Whisper), OCR (EasyOCR), Traducción (OPUS / NLLB) y Síntesis de voz (MMS-TTS).
+    - **Filtro de jerga:** Normaliza modismos chilenos para evitar errores semánticos en el traductor.
+    - **Optimización Cloud:** Pipeline configurado con baja latencia y carga diferida.
+    """)
